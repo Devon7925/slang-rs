@@ -1,13 +1,25 @@
 pub mod reflection;
 
+mod impls;
 #[cfg(test)]
 mod tests;
+mod utils;
 
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
+use std::ops::Deref;
 use std::ptr::{null, null_mut};
+use std::{mem, ptr};
 
-use slang_sys as sys;
+use impls::{FileSystemImpl, OwnedBlobImpl, StaticBlobImpl};
+
+use crate::sys::{Interface, vtable_call};
+
+pub use utils::{Error, Result};
+
+pub mod sys {
+	pub use slang_sys::*;
+}
 
 pub use sys::{
 	SlangBindingType as BindingType, SlangCompileTarget as CompileTarget,
@@ -19,60 +31,10 @@ pub use sys::{
 	SlangSourceLanguage as SourceLanguage, SlangStage as Stage, SlangTypeKind as TypeKind,
 	SlangUUID as UUID, slang_CompilerOptionName as CompilerOptionName,
 };
-
-macro_rules! vcall {
-	($self:expr, $method:ident($($args:expr),*)) => {
-		unsafe { ($self.vtable().$method)($self.as_raw(), $($args),*) }
-	};
-}
-
-const fn uuid(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> UUID {
-	UUID {
-		data1,
-		data2,
-		data3,
-		data4,
-	}
-}
-
-pub enum Error {
-	Code(sys::SlangResult),
-	Blob(Blob),
-}
-
-impl std::fmt::Debug for Error {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			Error::Code(code) => write!(f, "{}", code),
-			Error::Blob(blob) => write!(f, "{}", blob.as_str().unwrap_or_default()),
-		}
-	}
-}
-
-impl std::fmt::Display for Error {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		std::fmt::Debug::fmt(self, f)
-	}
-}
-
-impl std::error::Error for Error {}
-
-pub type Result<T> = std::result::Result<T, Error>;
+use utils::define_interface;
 
 pub(crate) fn succeeded(result: sys::SlangResult) -> bool {
 	result >= 0
-}
-
-fn result_from_blob(code: sys::SlangResult, blob: *mut sys::slang_IBlob) -> Result<()> {
-	if code < 0 && !blob.is_null() {
-		Err(Error::Blob(Blob(IUnknown(
-			std::ptr::NonNull::new(blob as *mut _).unwrap(),
-		))))
-	} else if code < 0 {
-		Err(Error::Code(code))
-	} else {
-		Ok(())
-	}
 }
 
 pub struct ProfileID(sys::SlangProfileID);
@@ -87,74 +49,12 @@ impl CapabilityID {
 	pub const UNKNOWN: CapabilityID = CapabilityID(sys::SlangCapabilityID_SlangCapabilityUnknown);
 }
 
-unsafe trait Interface: Sized {
-	type Vtable;
-	const IID: UUID;
-
-	#[inline(always)]
-	unsafe fn vtable(&self) -> &Self::Vtable {
-		unsafe { &**(self.as_raw() as *mut *mut Self::Vtable) }
-	}
-
-	#[inline(always)]
-	unsafe fn as_raw<T>(&self) -> *mut T {
-		unsafe { std::mem::transmute_copy(self) }
-	}
-
-	fn as_unknown(&self) -> &IUnknown {
-		// SAFETY: It is always safe to treat an `Interface` as an `IUnknown`.
-		unsafe { std::mem::transmute(self) }
-	}
-}
-
-pub unsafe trait Downcast<T> {
-	fn downcast(&self) -> &T;
-}
-
-#[repr(transparent)]
-pub struct IUnknown(std::ptr::NonNull<std::ffi::c_void>);
-
-unsafe impl Interface for IUnknown {
-	type Vtable = sys::ISlangUnknown__bindgen_vtable;
-	const IID: UUID = uuid(
-		0x00000000,
-		0x0000,
-		0x0000,
-		[0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
-	);
-}
-
-impl Clone for IUnknown {
-	fn clone(&self) -> Self {
-		vcall!(self, ISlangUnknown_addRef());
-		Self(self.0)
-	}
-}
-
-impl Drop for IUnknown {
-	fn drop(&mut self) {
-		vcall!(self, ISlangUnknown_release());
-	}
-}
-
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct Blob(IUnknown);
-
-unsafe impl Interface for Blob {
-	type Vtable = sys::IBlobVtable;
-	const IID: UUID = uuid(
-		0x8ba5fb08,
-		0x5195,
-		0x40e2,
-		[0xac, 0x58, 0x0d, 0x98, 0x9c, 0x3a, 0x01, 0x02],
-	);
-}
+define_interface!(Blob, sys::slang_IBlob, Debug);
 
 impl Blob {
 	pub fn as_slice(&self) -> &[u8] {
-		let ptr = vcall!(self, getBufferPointer());
-		let size = vcall!(self, getBufferSize());
+		let ptr = unsafe { vtable_call!(self.0, getBufferPointer()) };
+		let size = unsafe { vtable_call!(self.0, getBufferSize()) };
 		unsafe { std::slice::from_raw_parts(ptr as *const u8, size) }
 	}
 
@@ -163,133 +63,126 @@ impl Blob {
 	}
 }
 
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct GlobalSession(IUnknown);
+impl From<&'static [u8]> for Blob {
+	#[inline]
+	fn from(value: &'static [u8]) -> Self {
+		let blob = Box::leak(Box::new(StaticBlobImpl::new(value)));
 
-unsafe impl Interface for GlobalSession {
-	type Vtable = sys::IGlobalSessionVtable;
-	const IID: UUID = uuid(
-		0xc140b5fd,
-		0x0c78,
-		0x452e,
-		[0xba, 0x7c, 0x1a, 0x1e, 0x70, 0xc7, 0xf7, 0x1c],
-	);
+		Blob(blob as *mut _ as *mut _)
+	}
 }
 
+impl From<&'static str> for Blob {
+	#[inline]
+	fn from(value: &'static str) -> Self {
+		Self::from(value.as_bytes())
+	}
+}
+
+impl From<Vec<u8>> for Blob {
+	#[inline]
+	fn from(value: Vec<u8>) -> Self {
+		let blob = Box::leak(Box::new(OwnedBlobImpl::new(value)));
+
+		Blob(blob as *mut _ as *mut _)
+	}
+}
+
+impl From<String> for Blob {
+	#[inline]
+	fn from(value: String) -> Self {
+		Self::from(value.into_bytes())
+	}
+}
+
+define_interface!(GlobalSession, sys::slang_IGlobalSession, Debug);
+
 impl GlobalSession {
-	pub fn new() -> Option<GlobalSession> {
-		let mut global_session = null_mut();
-		unsafe { sys::slang_createGlobalSession(sys::SLANG_API_VERSION as _, &mut global_session) };
-		Some(GlobalSession(IUnknown(std::ptr::NonNull::new(
-			global_session as *mut _,
-		)?)))
+	pub fn new() -> utils::Result<Self> {
+		let mut session = ptr::null_mut();
+		utils::result_from_ffi(unsafe {
+			sys::slang_createGlobalSession(sys::SLANG_API_VERSION as _, &mut session)
+		})?;
+
+		Ok(Self(session))
 	}
 
-	pub fn new_without_core_module() -> Option<GlobalSession> {
-		let mut global_session = null_mut();
-		unsafe {
+	pub fn new_without_core_module() -> utils::Result<Self> {
+		let mut session = null_mut();
+		utils::result_from_ffi(unsafe {
 			sys::slang_createGlobalSessionWithoutCoreModule(
 				sys::SLANG_API_VERSION as _,
-				&mut global_session,
+				&mut session,
 			)
-		};
-		Some(GlobalSession(IUnknown(std::ptr::NonNull::new(
-			global_session as *mut _,
-		)?)))
+		})?;
+
+		Ok(Self(session))
 	}
 
-	pub fn create_session(&self, desc: &SessionDesc) -> Option<Session> {
+	pub fn create_session(&self, desc: &SessionDesc) -> utils::Result<Session> {
 		let mut session = null_mut();
-		vcall!(self, createSession(&**desc, &mut session));
-		Some(Session(IUnknown(std::ptr::NonNull::new(
-			session as *mut _,
-		)?)))
+		utils::result_from_ffi(unsafe {
+			vtable_call!(
+				self.0,
+				createSession(desc as *const SessionDesc as *const _, &mut session)
+			)
+		})?;
+		Ok(Session(session))
 	}
 
 	pub fn find_profile(&self, name: &str) -> ProfileID {
 		let name = CString::new(name).unwrap();
-		ProfileID(vcall!(self, findProfile(name.as_ptr())))
+		ProfileID(unsafe { vtable_call!(self.0, findProfile(name.as_ptr())) })
 	}
 
 	pub fn find_capability(&self, name: &str) -> CapabilityID {
 		let name = CString::new(name).unwrap();
-		CapabilityID(vcall!(self, findCapability(name.as_ptr())))
+		CapabilityID(unsafe { vtable_call!(self.0, findCapability(name.as_ptr())) })
 	}
 }
 
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct Session(IUnknown);
-
-unsafe impl Interface for Session {
-	type Vtable = sys::ISessionVtable;
-	const IID: UUID = uuid(
-		0x67618701,
-		0xd116,
-		0x468f,
-		[0xab, 0x3b, 0x47, 0x4b, 0xed, 0xce, 0x0e, 0x3d],
-	);
-}
+define_interface!(Session, sys::slang_ISession, Debug);
 
 impl Session {
-	pub fn load_module(&self, name: &str) -> Result<Module> {
+	pub fn load_module(&self, name: &str) -> utils::Result<Module> {
 		let name = CString::new(name).unwrap();
 		let mut diagnostics = null_mut();
 
-		let module = vcall!(self, loadModule(name.as_ptr(), &mut diagnostics));
+		let module = unsafe { vtable_call!(self.0, loadModule(name.as_ptr(), &mut diagnostics)) };
 
 		if module.is_null() {
-			let blob = Blob(IUnknown(
-				std::ptr::NonNull::new(diagnostics as *mut _).unwrap(),
-			));
-			Err(Error::Blob(blob))
+			Err(Error::Blob(Blob(diagnostics)))
 		} else {
-			let module = Module(IUnknown(std::ptr::NonNull::new(module as *mut _).unwrap()));
-			unsafe { (module.as_unknown().vtable().ISlangUnknown_addRef)(module.as_raw()) };
-			Ok(module)
+			Ok(Module(module))
 		}
 	}
 
 	pub fn create_composite_component_type(
 		&self,
-		components: &[ComponentType],
-	) -> Result<ComponentType> {
-		let mut composite_component_type = null_mut();
-		let mut diagnostics = null_mut();
+		component_types: &[ComponentType],
+	) -> utils::Result<ComponentType> {
+		let mut composite_component_type = ptr::null_mut();
+		let mut diagnostics = ptr::null_mut();
 
-		result_from_blob(
-			vcall!(
-				self,
-				createCompositeComponentType(
-					components.as_ptr() as _,
-					components.len() as _,
-					&mut composite_component_type,
-					&mut diagnostics
+		utils::result_from_blob(
+			unsafe {
+				vtable_call!(
+					self.0,
+					createCompositeComponentType(
+						component_types.as_ptr().cast(),
+						component_types.len() as _,
+						&mut composite_component_type,
+						&mut diagnostics
+					)
 				)
-			),
+			},
 			diagnostics,
 		)?;
-
-		Ok(ComponentType(IUnknown(
-			std::ptr::NonNull::new(composite_component_type as *mut _).unwrap(),
-		)))
+		Ok(ComponentType(composite_component_type))
 	}
 }
 
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct Metadata(IUnknown);
-
-unsafe impl Interface for Metadata {
-	type Vtable = sys::IMetadataVtable;
-	const IID: UUID = uuid(
-		0x8044a8a3,
-		0xddc0,
-		0x4b7f,
-		[0xaf, 0x8e, 0x2, 0x6e, 0x90, 0x5d, 0x73, 0x32],
-	);
-}
+define_interface!(Metadata, sys::slang_IMetadata, Debug);
 
 impl Metadata {
 	pub fn is_parameter_location_used(
@@ -299,218 +192,158 @@ impl Metadata {
 		register_index: u64,
 	) -> Option<bool> {
 		let mut used = false;
-		let res = vcall!(
-			self,
-			isParameterLocationUsed(category, space_index, register_index, &mut used)
-		);
-		succeeded(res).then(|| used)
+		let res = unsafe {
+			vtable_call!(
+				self.0,
+				isParameterLocationUsed(category, space_index, register_index, &mut used)
+			)
+		};
+		succeeded(res).then_some(used)
 	}
 }
 
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct ComponentType(IUnknown);
+define_interface!(ProgramLayout, sys::slang_ProgramLayout, Debug);
 
-unsafe impl Interface for ComponentType {
-	type Vtable = sys::IComponentTypeVtable;
-	const IID: UUID = uuid(
-		0x5bc42be8,
-		0x5c50,
-		0x4929,
-		[0x9e, 0x5e, 0xd1, 0x5e, 0x7c, 0x24, 0x01, 0x5f],
-	);
-}
+define_interface!(ComponentType, sys::slang_IComponentType, Debug);
 
 impl ComponentType {
-	pub fn layout(&self, target: i64) -> Result<&reflection::Shader> {
-		let mut diagnostics = null_mut();
-		let ptr = vcall!(self, getLayout(target, &mut diagnostics));
+	pub fn layout(&self, target_index: i64) -> Result<ProgramLayout> {
+		let mut diagnostics = ptr::null_mut();
 
-		if ptr.is_null() {
-			Err(Error::Blob(Blob(IUnknown(
-				std::ptr::NonNull::new(diagnostics as *mut _).unwrap(),
-			))))
+		let program_layout =
+			unsafe { vtable_call!(self.0, getLayout(target_index, &mut diagnostics)) };
+
+		if program_layout.is_null() {
+			Err(Error::Blob(Blob(diagnostics)))
 		} else {
-			Ok(unsafe { &*(ptr as *const _) })
+			Ok(ProgramLayout(program_layout))
 		}
 	}
 
-	pub fn link(&self) -> Result<ComponentType> {
+	pub fn link(&self) -> utils::Result<ComponentType> {
 		let mut linked_component_type = null_mut();
 		let mut diagnostics = null_mut();
 
-		result_from_blob(
-			vcall!(self, link(&mut linked_component_type, &mut diagnostics)),
+		utils::result_from_blob(
+			unsafe { vtable_call!(self.0, link(&mut linked_component_type, &mut diagnostics)) },
 			diagnostics,
 		)?;
 
-		Ok(ComponentType(IUnknown(
-			std::ptr::NonNull::new(linked_component_type as *mut _).unwrap(),
-		)))
+		Ok(ComponentType(linked_component_type))
 	}
 
-	pub fn target_code(&self, target: i64) -> Result<Blob> {
+	pub fn target_code(&self, target: i64) -> utils::Result<Blob> {
 		let mut code = null_mut();
 		let mut diagnostics = null_mut();
 
-		result_from_blob(
-			vcall!(self, getTargetCode(target, &mut code, &mut diagnostics)),
+		utils::result_from_blob(
+			unsafe { vtable_call!(self.0, getTargetCode(target, &mut code, &mut diagnostics)) },
 			diagnostics,
 		)?;
 
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(code as *mut _).unwrap(),
-		)))
+		Ok(Blob(code))
 	}
 
-	pub fn entry_point_code(&self, index: i64, target: i64) -> Result<Blob> {
+	pub fn entry_point_code(&self, index: i64, target: i64) -> utils::Result<Blob> {
 		let mut code = null_mut();
 		let mut diagnostics = null_mut();
 
-		result_from_blob(
-			vcall!(
-				self,
-				getEntryPointCode(index, target, &mut code, &mut diagnostics)
-			),
+		utils::result_from_blob(
+			unsafe {
+				vtable_call!(
+					self.0,
+					getEntryPointCode(index, target, &mut code, &mut diagnostics)
+				)
+			},
 			diagnostics,
 		)?;
 
-		Ok(Blob(IUnknown(
-			std::ptr::NonNull::new(code as *mut _).unwrap(),
-		)))
+		Ok(Blob(code))
 	}
 
-	pub fn target_metadata(&self, target_index: i64) -> Result<Metadata> {
+	pub fn target_metadata(&self, target_index: i64) -> utils::Result<Metadata> {
 		let mut metadata = null_mut();
 		let mut diagnostics = null_mut();
 
-		result_from_blob(
-			vcall!(
-				self,
-				getTargetMetadata(target_index, &mut metadata, &mut diagnostics)
-			),
+		utils::result_from_blob(
+			unsafe {
+				vtable_call!(
+					self.0,
+					getTargetMetadata(target_index, &mut metadata, &mut diagnostics)
+				)
+			},
 			diagnostics,
 		)?;
 
-		Ok(Metadata(IUnknown(
-			std::ptr::NonNull::new(metadata as *mut _).unwrap(),
-		)))
+		Ok(Metadata(metadata))
 	}
 
 	pub fn entry_point_metadata(
 		&self,
 		entry_point_index: i64,
 		target_index: i64,
-	) -> Result<Metadata> {
+	) -> utils::Result<Metadata> {
 		let mut metadata = null_mut();
 		let mut diagnostics = null_mut();
 
-		result_from_blob(
-			vcall!(
-				self,
-				getEntryPointMetadata(
-					entry_point_index,
-					target_index,
-					&mut metadata,
-					&mut diagnostics
+		utils::result_from_blob(
+			unsafe {
+				vtable_call!(
+					self.0,
+					getEntryPointMetadata(
+						entry_point_index,
+						target_index,
+						&mut metadata,
+						&mut diagnostics
+					)
 				)
-			),
+			},
 			diagnostics,
 		)?;
 
-		Ok(Metadata(IUnknown(
-			std::ptr::NonNull::new(metadata as *mut _).unwrap(),
-		)))
+		Ok(Metadata(metadata))
 	}
 }
 
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct EntryPoint(IUnknown);
-
-unsafe impl Interface for EntryPoint {
-	type Vtable = sys::IEntryPointVtable;
-	const IID: UUID = uuid(
-		0x8f241361,
-		0xf5bd,
-		0x4ca0,
-		[0xa3, 0xac, 0x02, 0xf7, 0xfa, 0x24, 0x02, 0xb8],
-	);
-}
-
-unsafe impl Downcast<ComponentType> for EntryPoint {
-	fn downcast(&self) -> &ComponentType {
-		unsafe { std::mem::transmute(self) }
-	}
-}
+define_interface!(EntryPoint, sys::slang_IEntryPoint, ComponentType);
 
 impl EntryPoint {
 	pub fn function_reflection(&self) -> &reflection::Function {
-		let ptr = vcall!(self, getFunctionReflection());
+		let ptr = unsafe { vtable_call!(self.0, getFunctionReflection()) };
 		unsafe { &*(ptr as *const _) }
 	}
 }
 
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct TypeConformance(IUnknown);
+define_interface!(TypeConformance, sys::slang_ITypeConformance, ComponentType);
 
-unsafe impl Interface for TypeConformance {
-	type Vtable = sys::ITypeConformanceVtable;
-	const IID: UUID = uuid(
-		0x73eb3147,
-		0xe544,
-		0x41b5,
-		[0xb8, 0xf0, 0xa2, 0x44, 0xdf, 0x21, 0x94, 0x0b],
-	);
-}
-
-unsafe impl Downcast<ComponentType> for TypeConformance {
-	fn downcast(&self) -> &ComponentType {
-		unsafe { std::mem::transmute(self) }
-	}
-}
-
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct Module(IUnknown);
-
-unsafe impl Interface for Module {
-	type Vtable = sys::IModuleVtable;
-	const IID: UUID = uuid(
-		0x0c720e64,
-		0x8722,
-		0x4d31,
-		[0x89, 0x90, 0x63, 0x8a, 0x98, 0xb1, 0xc2, 0x79],
-	);
-}
-
-unsafe impl Downcast<ComponentType> for Module {
-	fn downcast(&self) -> &ComponentType {
-		unsafe { std::mem::transmute(self) }
-	}
-}
+define_interface!(Module, sys::slang_IModule, ComponentType);
 
 impl Module {
-	pub fn find_entry_point_by_name(&self, name: &str) -> Option<EntryPoint> {
+	pub fn find_entry_point_by_name(&self, name: &str) -> utils::Result<EntryPoint> {
 		let name = CString::new(name).unwrap();
 		let mut entry_point = null_mut();
-		vcall!(self, findEntryPointByName(name.as_ptr(), &mut entry_point));
-		Some(EntryPoint(IUnknown(std::ptr::NonNull::new(
-			entry_point as *mut _,
-		)?)))
+		utils::result_from_ffi(unsafe {
+			vtable_call!(
+				self.0,
+				findEntryPointByName(name.as_ptr(), &mut entry_point)
+			)
+		})?;
+
+		Ok(EntryPoint(entry_point))
 	}
 
 	pub fn entry_point_count(&self) -> u32 {
-		vcall!(self, getDefinedEntryPointCount()) as _
+		unsafe { vtable_call!(self.0, getDefinedEntryPointCount()) as u32 }
 	}
 
-	pub fn entry_point_by_index(&self, index: u32) -> Option<EntryPoint> {
+	pub fn entry_point_by_index(&self, index: u32) -> utils::Result<EntryPoint> {
 		let mut entry_point = null_mut();
-		vcall!(self, getDefinedEntryPoint(index as _, &mut entry_point));
-		Some(EntryPoint(IUnknown(std::ptr::NonNull::new(
-			entry_point as *mut _,
-		)?)))
+
+		utils::result_from_ffi(unsafe {
+			vtable_call!(self.0, getDefinedEntryPoint(index as _, &mut entry_point))
+		})?;
+
+		Ok(EntryPoint(entry_point))
 	}
 
 	pub fn entry_points(&self) -> impl ExactSizeIterator<Item = EntryPoint> {
@@ -518,26 +351,26 @@ impl Module {
 	}
 
 	pub fn name(&self) -> &str {
-		let name = vcall!(self, getName());
+		let name = unsafe { vtable_call!(self.0, getName()) };
 		unsafe { CStr::from_ptr(name).to_str().unwrap() }
 	}
 
 	pub fn file_path(&self) -> &str {
-		let path = vcall!(self, getFilePath());
+		let path = unsafe { vtable_call!(self.0, getFilePath()) };
 		unsafe { CStr::from_ptr(path).to_str().unwrap() }
 	}
 
 	pub fn unique_identity(&self) -> &str {
-		let identity = vcall!(self, getUniqueIdentity());
+		let identity = unsafe { vtable_call!(self.0, getUniqueIdentity()) };
 		unsafe { CStr::from_ptr(identity).to_str().unwrap() }
 	}
 
 	pub fn dependency_file_count(&self) -> i32 {
-		vcall!(self, getDependencyFileCount()) as i32
+		unsafe { vtable_call!(self.0, getDependencyFileCount()) }
 	}
 
 	pub fn dependency_file_path(&self, index: i32) -> &str {
-		let path = vcall!(self, getDependencyFilePath(index as i32));
+		let path = unsafe { vtable_call!(self.0, getDependencyFilePath(index)) };
 		unsafe { CStr::from_ptr(path).to_str().unwrap() }
 	}
 
@@ -546,7 +379,7 @@ impl Module {
 	}
 
 	pub fn module_reflection(&self) -> &reflection::Decl {
-		let ptr = vcall!(self, getModuleReflection());
+		let ptr = unsafe { vtable_call!(self.0, getModuleReflection()) };
 		unsafe { &*(ptr as *const _) }
 	}
 }
@@ -595,6 +428,10 @@ impl<'a> TargetDesc<'a> {
 	}
 }
 
+pub trait FileSystem {
+	fn load_file(&self, path: &str) -> utils::Result<Blob>;
+}
+
 #[repr(transparent)]
 pub struct SessionDesc<'a> {
 	inner: sys::slang_SessionDesc,
@@ -637,6 +474,12 @@ impl<'a> SessionDesc<'a> {
 	pub fn options(mut self, options: &'a CompilerOptions) -> Self {
 		self.inner.compilerOptionEntries = options.options.as_ptr() as _;
 		self.inner.compilerOptionEntryCount = options.options.len() as _;
+		self
+	}
+
+	pub fn file_system(mut self, file_system: impl FileSystem + 'static) -> Self {
+		let file_system = Box::leak(Box::new(FileSystemImpl::new(Box::new(file_system))));
+		self.inner.fileSystem = file_system as *mut _ as *mut _;
 		self
 	}
 }

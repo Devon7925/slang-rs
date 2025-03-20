@@ -35,6 +35,8 @@ fn main() {
 		.allowlist_function("spComputeStringHash")
 		.allowlist_function("slang_.*")
 		.allowlist_type("slang.*")
+		.allowlist_type("FileSystemContentsCallBack")
+		.allowlist_type("PathKind")
 		.allowlist_var("SLANG_.*")
 		.with_codegen_config(
 			bindgen::CodegenConfig::FUNCTIONS
