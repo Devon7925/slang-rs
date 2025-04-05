@@ -1,5 +1,5 @@
 use super::{Type, TypeLayout, UserAttribute, rcall};
-use slang_sys as sys;
+use slang_sys::{self as sys, SlangImageFormat};
 
 #[repr(transparent)]
 pub struct Variable(sys::SlangReflectionVariable);
@@ -84,6 +84,10 @@ impl VariableLayout {
 
 	pub fn binding_space_with_category(&self, category: sys::SlangParameterCategory) -> usize {
 		rcall!(spReflectionVariableLayout_GetSpace(self, category))
+	}
+
+	pub fn image_format(&self) -> SlangImageFormat {
+		rcall!(spReflectionVariableLayout_GetImageFormat(self))
 	}
 
 	pub fn semantic_name(&self) -> Option<&str> {
