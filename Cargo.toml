@@ -11,6 +11,9 @@ paste = "1.0.15"
 slang-sys = { path = "slang-sys" }
 thiserror = "2.0.12"
 
+[features]
+serde = ["slang-sys/serde"]
+
 [workspace]
 members = [
 	"slang-sys"
